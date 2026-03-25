@@ -206,6 +206,18 @@ impl GaugeFactory {
         TAggregationBatcher: AggregationBatcher,
         TAggregationBatcher::TBatch: Send,
     {
+        let initial_delay = Duration::from_millis(
+            (SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .max(1)
+                % period.as_millis().max(1)) as u64,
+        );
+        // roughly align the reporting to a global interval, so the reports from various
+        // machines are more easy for downstream stores to compute time boundaries.
+        tokio::time::sleep(initial_delay).await;
+
         let mut interval = tokio::time::interval(period);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {

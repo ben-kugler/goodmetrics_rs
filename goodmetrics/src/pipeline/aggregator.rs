@@ -66,8 +66,10 @@ impl Display for DistributionMode {
 
 /// Primarily for testing and getting really deep into some stuff, here's
 /// a way to customize how you group aggregates over time.
+#[derive(Default)]
 pub enum TimeSource {
     /// The default time source.
+    #[default]
     SystemTime,
     /// You can customize time.
     DynamicTime {
@@ -85,11 +87,6 @@ impl std::fmt::Debug for TimeSource {
             Self::SystemTime => write!(f, "SystemTime"),
             Self::DynamicTime { .. } => f.debug_tuple("DynamicTime").finish(),
         }
-    }
-}
-impl Default for TimeSource {
-    fn default() -> Self {
-        Self::SystemTime
     }
 }
 
