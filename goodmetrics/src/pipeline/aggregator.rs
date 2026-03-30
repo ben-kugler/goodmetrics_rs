@@ -89,6 +89,36 @@ impl std::fmt::Debug for TimeSource {
         }
     }
 }
+impl TimeSource {
+    pub(crate) fn now_wall_clock(&self) -> SystemTime {
+        match self {
+            TimeSource::SystemTime => SystemTime::now(),
+            TimeSource::DynamicTime { now_wall_clock, .. } => now_wall_clock(),
+        }
+    }
+
+    pub(crate) fn now_timer(&self) -> Instant {
+        match self {
+            TimeSource::SystemTime => Instant::now(),
+            TimeSource::DynamicTime { now_timer, .. } => now_timer(),
+        }
+    }
+
+    pub(crate) fn duration_to_next_interval(&self, period: Duration) -> Duration {
+        let period_ns = period.as_nanos().max(1);
+        let elapsed_in_period = self
+            .now_wall_clock()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("could not get system time")
+            .as_nanos()
+            % period_ns;
+        Duration::from_nanos_u128(if elapsed_in_period == 0 {
+            0
+        } else {
+            period_ns - elapsed_in_period
+        })
+    }
+}
 
 /// A batcher for aggregated metrics.
 ///
@@ -167,22 +197,20 @@ where
     ) where
         TAggregationBatcher: AggregationBatcher,
     {
-        // Try to align to some even column since the epoch. It helps make metrics better-aligned when systems have well-aligned clocks.
-        // It's usually more convenient in grafana this way.
-        let extra_start_offset = self
-            .now_wall_clock()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("could not get system time")
-            .as_millis()
-            % cadence.as_millis();
-        tokio::time::sleep(Duration::from_millis(extra_start_offset as u64)).await;
-        let mut last_emit = self.now_timer();
+        // Align the first batch to the next epoch-aligned boundary so reports from
+        // various machines land on consistent time boundaries for downstream stores.
+        let align_delay = self.time_source.duration_to_next_interval(cadence);
+        tokio::time::sleep(align_delay).await;
+
+        let mut last_emit = self.time_source.now_timer();
 
         loop {
             self.receive_until_next_batch(last_emit, cadence).await;
 
-            last_emit = self.now_timer();
-            if let Some(batch) = self.drain_into(self.now_wall_clock(), cadence, &mut make_batch) {
+            last_emit = self.time_source.now_timer();
+            if let Some(batch) =
+                self.drain_into(self.time_source.now_wall_clock(), cadence, &mut make_batch)
+            {
                 match sender.try_send(batch) {
                     Ok(_) => {
                         log::info!("sent batch to sink")
@@ -198,7 +226,7 @@ where
     async fn receive_until_next_batch(&mut self, last_emit: Instant, cadence: Duration) {
         let mut look_for_more = true;
         while look_for_more {
-            let now = self.now_timer();
+            let now = self.time_source.now_timer();
             look_for_more = match now
                 .checked_duration_since(last_emit)
                 .and_then(|latency| cadence.checked_sub(latency))
@@ -307,20 +335,6 @@ where
                 },
                 Measurement::Sum(sum) => accumulate_sum(measurements_map, name, sum),
             });
-    }
-
-    fn now_wall_clock(&self) -> SystemTime {
-        match &self.time_source {
-            TimeSource::SystemTime => SystemTime::now(),
-            TimeSource::DynamicTime { now_wall_clock, .. } => now_wall_clock(),
-        }
-    }
-
-    fn now_timer(&self) -> Instant {
-        match &self.time_source {
-            TimeSource::SystemTime => Instant::now(),
-            TimeSource::DynamicTime { now_timer, .. } => now_timer(),
-        }
     }
 }
 
@@ -442,15 +456,18 @@ fn accumulate_sum(measurements_map: &mut HashMap<Name, Aggregation>, name: Name,
 mod test {
     use std::{
         collections::{BTreeMap, HashMap},
-        sync::mpsc::sync_channel,
-        time::{Duration, SystemTime},
+        sync::{mpsc::sync_channel, Arc, Mutex},
+        time::{Duration, Instant, SystemTime},
     };
 
     use crate::{
         aggregation::StatisticSet,
         allocator::{AlwaysNewMetricsAllocator, MetricsAllocator},
         metrics::Metrics,
-        pipeline::aggregator::{Aggregation, Aggregator, DistributionMode},
+        pipeline::{
+            aggregator::{Aggregation, Aggregator, DistributionMode},
+            TimeSource,
+        },
         types::{Dimension, Name, Observation},
     };
 
@@ -568,5 +585,53 @@ mod test {
         metrics.dimension(dimension_name, dimension);
         metrics.measurement(measurement_name, measurement);
         metrics
+    }
+
+    struct TestTimeSource {
+        now_wall_clock: SystemTime,
+        now_timer: Instant,
+    }
+
+    #[test]
+    fn test_time_source() {
+        let time = Arc::new(Mutex::new(TestTimeSource {
+            now_wall_clock: SystemTime::UNIX_EPOCH,
+            now_timer: Instant::now(),
+        }));
+        let t1 = time.clone();
+        let t2 = time.clone();
+        let time_source = TimeSource::DynamicTime {
+            now_wall_clock: Box::new(move || t1.lock().unwrap().now_wall_clock),
+            now_timer: Box::new(move || t2.lock().unwrap().now_timer),
+            sleep: Box::new(|_| {}),
+        };
+
+        assert_eq!(time_source.now_wall_clock(), SystemTime::UNIX_EPOCH);
+        assert_eq!(
+            time_source.duration_to_next_interval(Duration::from_secs(10)),
+            Duration::from_secs(0),
+            "it is exactly on the boundary"
+        );
+
+        time.lock().unwrap().now_wall_clock += Duration::from_secs(1);
+        assert_eq!(
+            time_source.duration_to_next_interval(Duration::from_secs(10)),
+            Duration::from_secs(9),
+            "1 second has passed, so 9 seconds until the next boundary"
+        );
+
+        time.lock().unwrap().now_wall_clock += Duration::from_secs(9);
+        assert_eq!(
+            time_source.duration_to_next_interval(Duration::from_secs(10)),
+            Duration::from_secs(0),
+            "back on the boundary"
+        );
+
+        time.lock().unwrap().now_wall_clock -= Duration::from_nanos(1);
+        assert_eq!(
+            time_source.duration_to_next_interval(Duration::from_secs(10)),
+            Duration::from_nanos(1),
+            "1 nanosecond until the next boundary"
+        );
     }
 }
