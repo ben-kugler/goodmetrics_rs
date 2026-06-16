@@ -24,8 +24,8 @@ use crate::{
     proto::opentelemetry::{metrics::v1::Gauge, resource::v1::Resource},
 };
 use crate::{
-    aggregation::{bucket_10_below_2_sigfigs, Aggregation, StatisticSet},
-    pipeline::{DimensionPosition, DimensionedMeasurementsMap},
+    aggregation::{bucket_10_below_2_sigfigs, AbsorbDistribution, Aggregation, StatisticSet},
+    pipeline::{DimensionPosition, DimensionedMeasurementsMap, DistributionMode, MetricsBatcher},
     proto::opentelemetry::{
         self,
         collector::metrics::v1::{
@@ -37,7 +37,7 @@ use crate::{
             ScopeMetrics,
         },
     },
-    types::{Dimension, Name},
+    types::{Dimension, Distribution, Measurement, Name, Observation},
 };
 
 use super::{EpochTime, MetricsSender, StdError};
@@ -202,6 +202,136 @@ impl AggregationBatcher for OpentelemetryBatcher {
                 as_metrics(name, now, covered_time, dimensioned_measurements)
             })
             .collect()
+    }
+}
+
+impl MetricsBatcher for OpentelemetryBatcher {
+    type TBatch = Vec<Metric>;
+
+    fn batch_unaggregated(
+        &mut self,
+        now: SystemTime,
+        covered_time: Duration,
+        distribution_mode: DistributionMode,
+        name: Name,
+        dimensions: DimensionPosition,
+        measurements: Vec<(Name, Measurement)>,
+    ) -> Self::TBatch {
+        // One recording becomes one datum.
+        let otel_dimensions = as_otel_dimensions(dimensions);
+        measurements
+            .into_iter()
+            .map(|(measurement_name, measurement)| {
+                let full_measurement_name = format!("{name}_{measurement_name}");
+                match measurement {
+                    Measurement::Observation(observation) => as_otel_gauge(
+                        full_measurement_name,
+                        now,
+                        covered_time,
+                        &otel_dimensions,
+                        observation_to_value(&observation),
+                    ),
+                    Measurement::Distribution(distribution) => as_otel_distribution(
+                        full_measurement_name,
+                        now,
+                        covered_time,
+                        distribution_mode,
+                        otel_dimensions.clone(),
+                        distribution,
+                    ),
+                    Measurement::Sum(sum) => as_otel_sum(
+                        Sum { sum },
+                        &full_measurement_name,
+                        now,
+                        covered_time,
+                        &otel_dimensions,
+                    ),
+                }
+            })
+            .collect()
+    }
+}
+
+fn observation_to_value(
+    observation: &Observation,
+) -> opentelemetry::metrics::v1::number_data_point::Value {
+    match observation {
+        Observation::I64(n) => (*n).into(),
+        Observation::I32(n) => (*n as i64).into(),
+        Observation::U64(n) => (*n).into(),
+        Observation::U32(n) => (*n as u64).into(),
+        Observation::F64(n) => (*n).into(),
+        Observation::F32(n) => (*n as f64).into(),
+    }
+}
+
+/// A single raw value sent as an opentelemetry gauge.
+fn as_otel_gauge(
+    full_measurement_name: String,
+    timestamp: SystemTime,
+    duration: Duration,
+    attributes: &[KeyValue],
+    value: opentelemetry::metrics::v1::number_data_point::Value,
+) -> Metric {
+    let timestamp_nanos = timestamp.nanos_since_epoch();
+    let start_nanos = timestamp_nanos - duration.as_nanos() as u64;
+    Metric {
+        name: full_measurement_name,
+        data: Some(opentelemetry::metrics::v1::metric::Data::Gauge(Gauge {
+            data_points: vec![new_number_data_point(
+                timestamp_nanos,
+                start_nanos,
+                attributes,
+                value,
+            )],
+        })),
+        description: "".into(),
+        unit: "1".into(),
+    }
+}
+
+/// A single recorded distribution rendered as a histogram, per the distribution mode.
+fn as_otel_distribution(
+    full_measurement_name: String,
+    timestamp: SystemTime,
+    duration: Duration,
+    distribution_mode: DistributionMode,
+    attributes: Vec<KeyValue>,
+    distribution: Distribution,
+) -> Metric {
+    let data = match distribution_mode {
+        DistributionMode::Histogram => {
+            let mut histogram = Histogram::default();
+            histogram.absorb(distribution);
+            opentelemetry::metrics::v1::metric::Data::Histogram(as_otel_histogram(
+                histogram, timestamp, duration, attributes,
+            ))
+        }
+        DistributionMode::ExponentialHistogram {
+            max_buckets,
+            desired_scale,
+        } => {
+            let mut exponential_histogram =
+                ExponentialHistogram::new_with_max_buckets(desired_scale, max_buckets);
+            exponential_histogram.absorb(distribution);
+            opentelemetry::metrics::v1::metric::Data::ExponentialHistogram(
+                as_otel_exponential_histogram(
+                    exponential_histogram,
+                    timestamp,
+                    duration,
+                    attributes,
+                ),
+            )
+        }
+        DistributionMode::TDigest => {
+            unimplemented!("tdigest for opentelemetry is not implemented")
+        }
+    };
+    Metric {
+        name: full_measurement_name,
+        data: Some(data),
+        description: "".into(),
+        unit: "1".into(),
     }
 }
 

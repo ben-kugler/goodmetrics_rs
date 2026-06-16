@@ -138,6 +138,26 @@ pub trait AggregationBatcher {
     ) -> Self::TBatch;
 }
 
+/// Converts a single recorded metric straight into a wire batch, with no
+/// time-window aggregation. Each observation becomes one raw datapoint and each
+/// distribution becomes one histogram. This is the per-record path used by the
+/// lambda pipeline.
+pub trait MetricsBatcher {
+    /// Type of batch this batcher produces.
+    type TBatch;
+
+    /// Convert one recorded metric's dimensions and measurements into a batch.
+    fn batch_unaggregated(
+        &mut self,
+        now: SystemTime,
+        covered_time: Duration,
+        distribution_mode: DistributionMode,
+        name: Name,
+        dimensions: DimensionPosition,
+        measurements: Vec<(Name, Measurement)>,
+    ) -> Self::TBatch;
+}
+
 /// Aggregates metrics and presents a pollable interface for creating batches of metrics.
 pub struct Aggregator<TMetricsRef> {
     metrics_queue: std::sync::mpsc::Receiver<TMetricsRef>,

@@ -13,7 +13,8 @@ mod stream_sink;
 
 pub use aggregator::{
     AggregatedMetricsMap, AggregationBatcher, Aggregator, DimensionPosition,
-    DimensionedMeasurementsMap, DistributionMode, MeasurementAggregationMap, TimeSource,
+    DimensionedMeasurementsMap, DistributionMode, MeasurementAggregationMap, MetricsBatcher,
+    TimeSource,
 };
 pub use lambda::{lambda_metrics, LambdaFlusher, LambdaSink};
 pub use logging_sink::LoggingSink;

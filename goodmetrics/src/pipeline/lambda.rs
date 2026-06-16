@@ -1,30 +1,21 @@
-//! An immediate, unaggregated metrics pipeline for serverless / lambda environments.
-//!
-//! The default goodmetrics pipeline accumulates metrics into an
-//! [`Aggregator`](crate::pipeline::Aggregator) and a background task drains it on
-//! an interval. That model assumes the process keeps running between reports. In a
-//! lambda the process is frozen the instant your handler returns, so a background
-//! interval task can't reliably deliver anything.
-//!
-//! This module flips the model around: each `Metrics` is converted to a wire batch
-//! the moment it is recorded (no time-window aggregation) and buffered. You then
-//! [`flush`](LambdaFlusher::flush) the buffer at the end of your handler, which
-//! sends everything downstream and awaits delivery before you return. The buffer is
-//! also flushed best-effort when the [`LambdaFlusher`] is dropped.
-//!
+// For use in monitoring environments where preaggregation is not necessary; lambda env
+// require no preaggregation, instead we'd like to send metrics on a per-record basis.
+// Each recorded Metrics becomes its own batch and each measurement is sent as an
+// individual datapoint.
+//
 //! ```no_run
 //! # async fn example() {
 //! use goodmetrics::MetricsFactory;
 //! use goodmetrics::allocator::AlwaysNewMetricsAllocator;
-//! use goodmetrics::downstream::{get_client, GoodmetricsBatcher, GoodmetricsDownstream};
+//! use goodmetrics::downstream::{get_client, OpentelemetryBatcher, OpenTelemetryDownstream};
 //! use goodmetrics::pipeline::{lambda_metrics, DistributionMode};
 //!
 //! // 1. Build a downstream as usual:
-//! let downstream = GoodmetricsDownstream::new(
+//! let downstream = OpenTelemetryDownstream::new_with_dimensions(
 //!     get_client(
 //!         "https://ingest.example.com",
 //!         || None,
-//!         goodmetrics::proto::goodmetrics::metrics_client::MetricsClient::with_origin,
+//!         goodmetrics::proto::opentelemetry::collector::metrics::v1::metrics_service_client::MetricsServiceClient::with_origin,
 //!     ).expect("channel"),
 //!     Some(("authorization", "token".parse().expect("header"))),
 //!     [("application", "example")],
@@ -33,7 +24,7 @@
 //! // 2. Wire up the immediate pipeline. Keep the factory and flusher around across
 //! //    invocations (e.g. in your cold-start setup).
 //! let (sink, mut flusher) =
-//!     lambda_metrics(downstream, GoodmetricsBatcher, DistributionMode::Histogram);
+//!     lambda_metrics(downstream, OpentelemetryBatcher, DistributionMode::Histogram);
 //! let metrics_factory: MetricsFactory<AlwaysNewMetricsAllocator, _> = MetricsFactory::new(sink);
 //!
 //! // 3. In each invocation, record metrics then flush before returning:
@@ -51,23 +42,23 @@ use std::time::SystemTime;
 
 use crate::allocator::MetricsRef;
 use crate::downstream::MetricsSender;
+use crate::types::Name;
 
-use super::aggregator::aggregate_metrics_into;
-use super::{AggregatedMetricsMap, AggregationBatcher, DimensionPosition, DistributionMode, Sink};
+use super::{DimensionPosition, DistributionMode, MetricsBatcher, Sink};
 
 /// Shared buffer of converted-but-not-yet-sent wire batches.
 type Buffer<TBatch> = Arc<Mutex<Vec<TBatch>>>;
 
 /// A Sink that converts each Metrics into a wire batch immediately, with no
-/// time-window aggregation, and buffers it until the paired LambdaFlusher sends
+/// time-window aggregation, buffers until the paired LambdaFlusher sends
 /// it.
-pub struct LambdaSink<TBatcher: AggregationBatcher> {
+pub struct LambdaSink<TBatcher: MetricsBatcher> {
     buffer: Buffer<TBatcher::TBatch>,
     batcher: Mutex<TBatcher>,
     distribution_mode: DistributionMode,
 }
 
-impl<TBatcher: AggregationBatcher> LambdaSink<TBatcher> {
+impl<TBatcher: MetricsBatcher> LambdaSink<TBatcher> {
     fn new(
         buffer: Buffer<TBatcher::TBatch>,
         batcher: TBatcher,
@@ -83,7 +74,7 @@ impl<TBatcher: AggregationBatcher> LambdaSink<TBatcher> {
 
 impl<TBatcher> Clone for LambdaSink<TBatcher>
 where
-    TBatcher: AggregationBatcher + Clone,
+    TBatcher: MetricsBatcher + Clone,
 {
     fn clone(&self) -> Self {
         Self {
@@ -97,41 +88,42 @@ where
 impl<TMetricsRef, TBatcher> Sink<TMetricsRef> for LambdaSink<TBatcher>
 where
     TMetricsRef: MetricsRef,
-    TBatcher: AggregationBatcher,
+    TBatcher: MetricsBatcher,
 {
-    fn accept(&self, to_sink: TMetricsRef) {
-        // Use the recorded scope's elapsed time as the window this single batch
-        // covers, so downstreams that care about start/end timestamps get a
-        // sensible (non-zero) interval.
+    fn accept(&self, mut to_sink: TMetricsRef) {
+        // Use the recorded scope's elapsed time as the window for single batchs
         let covered_time = to_sink.as_ref().start_time.elapsed();
 
-        let mut map = AggregatedMetricsMap::default();
-        let mut position = DimensionPosition::default();
-        aggregate_metrics_into(&mut map, self.distribution_mode, &mut position, to_sink);
+        let metrics = to_sink.as_mut();
+        let name = std::mem::replace(&mut metrics.metrics_name, Name::Str("_uninitialized_"));
+        let (dimensions, measurements) = metrics.drain();
+        let dimensions: DimensionPosition = dimensions.drain().collect();
+        let measurements: Vec<_> = measurements.drain().collect();
 
         let batch = self
             .batcher
             .lock()
             .expect("local mutex")
-            .batch_aggregations(SystemTime::now(), covered_time, &mut map);
+            .batch_unaggregated(
+                SystemTime::now(),
+                covered_time,
+                self.distribution_mode,
+                name,
+                dimensions,
+                measurements,
+            );
         self.buffer.lock().expect("local mutex").push(batch);
     }
 }
 
-/// Sends batches buffered by a [`LambdaSink`] downstream on demand.
-///
-/// Call [`flush`](Self::flush) at the end of each invocation to deliver everything
-/// recorded so far and await delivery. Anything still buffered when the flusher is
-/// dropped is flushed best-effort (see [`Drop`]).
+/// Sends batches buffered by a LambdaSink downstream on demand.
 pub struct LambdaFlusher<TSender: MetricsSender> {
     buffer: Buffer<TSender::Batch>,
     downstream: TSender,
 }
 
 impl<TSender: MetricsSender> LambdaFlusher<TSender> {
-    /// Send every batch buffered so far, awaiting delivery. Cheap and safe to call
-    /// when nothing is buffered, so call it unconditionally at the end of each
-    /// invocation.
+    /// Send every batch buffered so far, awaiting delivery.=
     pub async fn flush(&mut self) {
         let batches = std::mem::take(&mut *self.buffer.lock().expect("local mutex"));
         for batch in batches {
@@ -147,28 +139,11 @@ impl<TSender: MetricsSender> Drop for LambdaFlusher<TSender> {
             .lock()
             .map(|buffer| !buffer.is_empty())
             .unwrap_or(false);
-        if !has_unflushed {
-            return;
-        }
-
-        // Drop is synchronous but flushing is async. We can only drive it to
-        // completion on a multi-threaded runtime via block_in_place; everywhere
-        // else we warn rather than risk a panic or a silent drop. The supported
-        // path is always to call flush().await yourself before returning.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => match handle.runtime_flavor() {
-                tokio::runtime::RuntimeFlavor::MultiThread => {
-                    tokio::task::block_in_place(|| handle.block_on(self.flush()));
-                }
-                _ => log::warn!(
-                    "LambdaFlusher dropped with unflushed metrics on a current-thread runtime; \
-                     call flush().await before returning to guarantee delivery"
-                ),
-            },
-            Err(_) => log::warn!(
-                "LambdaFlusher dropped with unflushed metrics outside of a tokio runtime; \
-                 these metrics were not sent"
-            ),
+        if has_unflushed {
+            log::error!(
+                "LambdaFlusher dropped with unflushed metrics, \
+                call flush().await before returning to guarantee delivery"
+            )
         }
     }
 }
@@ -186,7 +161,7 @@ pub fn lambda_metrics<TSender, TBatcher>(
 ) -> (LambdaSink<TBatcher>, LambdaFlusher<TSender>)
 where
     TSender: MetricsSender,
-    TBatcher: AggregationBatcher<TBatch = TSender::Batch>,
+    TBatcher: MetricsBatcher<TBatch = TSender::Batch>,
 {
     let buffer: Buffer<TSender::Batch> = Default::default();
     (
@@ -202,9 +177,9 @@ mod test {
 
     use crate::{
         allocator::AlwaysNewMetricsAllocator,
-        downstream::{GoodmetricsBatcher, MetricsSender},
+        downstream::{GoodmetricsBatcher, MetricsSender, OpentelemetryBatcher},
         pipeline::DistributionMode,
-        proto::goodmetrics::Datum,
+        proto::{goodmetrics::Datum, opentelemetry::metrics::v1::Metric},
         MetricsFactory,
     };
 
@@ -217,6 +192,22 @@ mod test {
     }
     impl MetricsSender for RecordingSender {
         type Batch = Vec<Datum>;
+        fn send_batch(
+            &mut self,
+            batch: Self::Batch,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.sent.lock().unwrap().push(batch);
+            Box::pin(async {})
+        }
+    }
+
+    /// As [`RecordingSender`], but for the opentelemetry wire type.
+    #[derive(Default, Clone)]
+    struct RecordingOtelSender {
+        sent: Arc<Mutex<Vec<Vec<Metric>>>>,
+    }
+    impl MetricsSender for RecordingOtelSender {
+        type Batch = Vec<Metric>;
         fn send_batch(
             &mut self,
             batch: Self::Batch,
@@ -270,6 +261,59 @@ mod test {
             sent.lock().unwrap().len(),
             "three recordings stay as three separate, unaggregated batches"
         );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn opentelemetry_observation_is_a_single_raw_gauge() {
+        use crate::proto::opentelemetry::metrics::v1::metric::Data;
+
+        let downstream = RecordingOtelSender::default();
+        let sent = downstream.sent.clone();
+        let (sink, mut flusher): (LambdaSink<OpentelemetryBatcher>, _) = lambda_metrics(
+            downstream,
+            OpentelemetryBatcher,
+            DistributionMode::Histogram,
+        );
+        let factory: MetricsFactory<AlwaysNewMetricsAllocator, _> = MetricsFactory::new(sink);
+
+        {
+            let mut metrics = factory.record_scope("handler");
+            metrics.measurement("items", 3);
+        }
+        flusher.flush().await;
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(1, sent.len(), "one invocation produced one batch");
+        let batch = &sent[0];
+
+        // The observation must be one raw gauge, not expanded into a four-part
+        // min/max/sum/count statistic set as the aggregating pipeline would do.
+        // (record_scope also records a `totaltime` distribution, so the batch has
+        // more than just this metric.)
+        let items: Vec<_> = batch
+            .iter()
+            .filter(|m| m.name.starts_with("handler_items"))
+            .collect();
+        assert_eq!(
+            vec!["handler_items"],
+            items.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            "the observation is one metric named handler_items, with no _min/_max/_sum/_count"
+        );
+        match items[0].data.as_ref().expect("data") {
+            Data::Gauge(gauge) => {
+                assert_eq!(
+                    1,
+                    gauge.data_points.len(),
+                    "one datapoint for the one value"
+                );
+                use crate::proto::opentelemetry::metrics::v1::number_data_point::Value;
+                assert!(
+                    matches!(gauge.data_points[0].value, Some(Value::AsInt(3))),
+                    "the raw recorded value is preserved as an integer gauge"
+                );
+            }
+            other => panic!("observation should become a gauge, got {other:?}"),
+        }
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 2))]

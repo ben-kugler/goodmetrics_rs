@@ -14,7 +14,10 @@ use crate::{
     aggregation::{
         AbsorbDistribution, Aggregation, Centroid, Histogram, OnlineTdigest, StatisticSet,
     },
-    pipeline::{AggregatedMetricsMap, AggregationBatcher, DimensionedMeasurementsMap},
+    pipeline::{
+        AggregatedMetricsMap, AggregationBatcher, DimensionPosition, DimensionedMeasurementsMap,
+        DistributionMode, MetricsBatcher,
+    },
     proto::{
         self,
         goodmetrics::{metrics_client::MetricsClient, Datum, MetricsRequest},
@@ -146,6 +149,34 @@ impl AggregationBatcher for GoodmetricsBatcher {
                 as_datums(name, now, covered_time, dimensioned_measurements)
             })
             .collect()
+    }
+}
+
+impl MetricsBatcher for GoodmetricsBatcher {
+    type TBatch = Vec<Datum>;
+
+    fn batch_unaggregated(
+        &mut self,
+        now: SystemTime,
+        _covered_time: Duration,
+        _distribution_mode: DistributionMode,
+        name: Name,
+        dimensions: DimensionPosition,
+        measurements: Vec<(Name, Measurement)>,
+    ) -> Self::TBatch {
+        // One recording becomes one datum.
+        vec![Datum {
+            metric: name.to_string(),
+            unix_nanos: now.nanos_since_epoch(),
+            dimensions: dimensions
+                .into_iter()
+                .map(|(name, dimension)| (name.into(), dimension.into()))
+                .collect(),
+            measurements: measurements
+                .into_iter()
+                .map(|(name, measurement)| (name.into(), measurement.into()))
+                .collect(),
+        }]
     }
 }
 

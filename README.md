@@ -40,8 +40,7 @@ anything.
 For that case, use `lambda_metrics`. Each `Metrics` is converted to a wire batch the moment it is
 recorded (no time-window aggregation) and buffered; you flush the buffer at the end of each
 invocation, which sends everything and awaits delivery before you return. It works with both the
-goodmetrics and opentelemetry downstreams. See [the lambda example](./goodmetrics/examples/lambda.rs)
-for a complete setup, or run it with `cargo run --example lambda`.
+goodmetrics and opentelemetry downstreams.
 
 ```rust
 // Cold start: build these once and reuse them across invocations.
