@@ -30,6 +30,36 @@ metrics.distribution("some_continuous_value", instantaneous_network_bandwidth); 
 
 Once the `metrics` object is dropped from scope, it will export metrics to your desired ingest. If you need to publish metrics at some immediate point, you can manually `drop()` the object.
 
+### Lambda / immediate (unaggregated) pipeline
+
+The default pipeline accumulates metrics in an `Aggregator` and a background task drains it on
+an interval. That assumes the process keeps running between reports. In a lambda the process is
+frozen the instant your handler returns, so a background interval task can't reliably deliver
+anything.
+
+For that case, use `lambda_metrics`. Each `Metrics` is converted to a wire batch the moment it is
+recorded (no time-window aggregation) and buffered; you flush the buffer at the end of each
+invocation, which sends everything and awaits delivery before you return. It works with both the
+goodmetrics and opentelemetry downstreams. See [the lambda example](./goodmetrics/examples/lambda.rs)
+for a complete setup, or run it with `cargo run --example lambda`.
+
+```rust
+// Cold start: build these once and reuse them across invocations.
+let (sink, mut flusher) = lambda_metrics(downstream, GoodmetricsBatcher, DistributionMode::Histogram);
+let metrics_factory: MetricsFactory<AlwaysNewMetricsAllocator, _> = MetricsFactory::new(sink);
+
+// Per invocation:
+{
+    let mut metrics = metrics_factory.record_scope("handler");
+    metrics.measurement("items", 3);
+} // converted and buffered here, on drop
+flusher.flush().await; // delivered before the handler returns
+```
+
+The buffer is also flushed best-effort when the `LambdaFlusher` is dropped (synchronously on a
+multi-threaded tokio runtime). The supported, guaranteed path is always to call `flush().await`
+yourself before returning.
+
 ### Record scope without measuring time
 
 Not every unit of work needs a measurement of how long it took to complete. Simply create a metrics object by calling `record_scope_with_behavior` and passing in your desired behavior.

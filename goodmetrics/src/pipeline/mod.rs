@@ -6,6 +6,7 @@ use futures::StreamExt;
 use futures_batch::ChunksTimeoutStreamExt;
 
 mod aggregator;
+mod lambda;
 mod logging_sink;
 mod serializing_sink;
 mod stream_sink;
@@ -14,6 +15,7 @@ pub use aggregator::{
     AggregatedMetricsMap, AggregationBatcher, Aggregator, DimensionPosition,
     DimensionedMeasurementsMap, DistributionMode, MeasurementAggregationMap, TimeSource,
 };
+pub use lambda::{lambda_metrics, LambdaFlusher, LambdaSink};
 pub use logging_sink::LoggingSink;
 pub use serializing_sink::SerializingSink;
 pub use stream_sink::StreamSink;

@@ -277,65 +277,81 @@ where
         Some(batcher.batch_aggregations(timestamp, duration, &mut self.map))
     }
 
-    fn aggregate_metrics(&mut self, mut sunk_metrics: TMetricsRef) {
-        let metrics_name = replace(
-            &mut sunk_metrics.as_mut().metrics_name,
-            Name::Str("_uninitialized_"),
+    fn aggregate_metrics(&mut self, sunk_metrics: TMetricsRef) {
+        aggregate_metrics_into(
+            &mut self.map,
+            self.distribution_mode,
+            &mut self.cached_position,
+            sunk_metrics,
         );
-        let (dimensions, measurements) = sunk_metrics.as_mut().drain();
-
-        let dimensioned_measurements_map: &mut DimensionedMeasurementsMap =
-            match self.map.get_mut(&metrics_name) {
-                Some(existing) => existing,
-                None => {
-                    self.map.insert(metrics_name.clone(), Default::default());
-                    self.map
-                        .get_mut(&metrics_name)
-                        .expect("I just inserted this 1 line above")
-                }
-            };
-
-        self.cached_position.extend(dimensions.drain()); // Use the cached memory
-        let measurements_map: &mut MeasurementAggregationMap =
-            match dimensioned_measurements_map.get_mut(&self.cached_position) {
-                Some(map) => map,
-                None => {
-                    dimensioned_measurements_map
-                        .insert(self.cached_position.clone(), Default::default());
-                    dimensioned_measurements_map
-                        .get_mut(&self.cached_position)
-                        .expect("I just inserted this 1 line above")
-                }
-            };
-        self.cached_position.clear(); // Return the cached memory
-
-        measurements
-            .drain()
-            .for_each(|(name, measurement)| match measurement {
-                Measurement::Observation(observation) => {
-                    accumulate_statisticset(measurements_map, name, observation);
-                }
-                Measurement::Distribution(distribution) => match self.distribution_mode {
-                    DistributionMode::Histogram => {
-                        accumulate_histogram(measurements_map, name, distribution);
-                    }
-                    DistributionMode::TDigest => {
-                        accumulate_tdigest(measurements_map, name, distribution);
-                    }
-                    DistributionMode::ExponentialHistogram {
-                        max_buckets,
-                        desired_scale,
-                    } => accumulate_exponential_histogram(
-                        measurements_map,
-                        name,
-                        distribution,
-                        max_buckets,
-                        desired_scale,
-                    ),
-                },
-                Measurement::Sum(sum) => accumulate_sum(measurements_map, name, sum),
-            });
     }
+}
+
+/// Fold a single metrics object into an aggregation map.
+
+pub(crate) fn aggregate_metrics_into<TMetricsRef>(
+    map: &mut AggregatedMetricsMap,
+    distribution_mode: DistributionMode,
+    cached_position: &mut DimensionPosition,
+    mut sunk_metrics: TMetricsRef,
+) where
+    TMetricsRef: MetricsRef,
+{
+    let metrics_name = replace(
+        &mut sunk_metrics.as_mut().metrics_name,
+        Name::Str("_uninitialized_"),
+    );
+    let (dimensions, measurements) = sunk_metrics.as_mut().drain();
+
+    let dimensioned_measurements_map: &mut DimensionedMeasurementsMap =
+        match map.get_mut(&metrics_name) {
+            Some(existing) => existing,
+            None => {
+                map.insert(metrics_name.clone(), Default::default());
+                map.get_mut(&metrics_name)
+                    .expect("I just inserted this 1 line above")
+            }
+        };
+
+    cached_position.extend(dimensions.drain()); // Use the cached memory
+    let measurements_map: &mut MeasurementAggregationMap =
+        match dimensioned_measurements_map.get_mut(cached_position) {
+            Some(map) => map,
+            None => {
+                dimensioned_measurements_map.insert(cached_position.clone(), Default::default());
+                dimensioned_measurements_map
+                    .get_mut(cached_position)
+                    .expect("I just inserted this 1 line above")
+            }
+        };
+    cached_position.clear(); // Return the cached memory
+
+    measurements
+        .drain()
+        .for_each(|(name, measurement)| match measurement {
+            Measurement::Observation(observation) => {
+                accumulate_statisticset(measurements_map, name, observation);
+            }
+            Measurement::Distribution(distribution) => match distribution_mode {
+                DistributionMode::Histogram => {
+                    accumulate_histogram(measurements_map, name, distribution);
+                }
+                DistributionMode::TDigest => {
+                    accumulate_tdigest(measurements_map, name, distribution);
+                }
+                DistributionMode::ExponentialHistogram {
+                    max_buckets,
+                    desired_scale,
+                } => accumulate_exponential_histogram(
+                    measurements_map,
+                    name,
+                    distribution,
+                    max_buckets,
+                    desired_scale,
+                ),
+            },
+            Measurement::Sum(sum) => accumulate_sum(measurements_map, name, sum),
+        });
 }
 
 fn accumulate_histogram(

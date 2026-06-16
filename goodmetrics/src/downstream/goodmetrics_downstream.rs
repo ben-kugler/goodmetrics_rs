@@ -22,7 +22,7 @@ use crate::{
     types::{Dimension, Distribution, Measurement, Name, Observation},
 };
 
-use super::{EpochTime, StdError};
+use super::{EpochTime, MetricsSender, StdError};
 
 /// A downstream that sends metrics to a `goodmetricsd` or other goodmetrics grpc server.
 pub struct GoodmetricsDownstream<TChannel> {
@@ -71,29 +71,34 @@ where
             interval.tick().await;
             // Send as quickly as possible while there are more batches
             while let Some(batch) = pin!(&mut receiver).next().await {
-                let result = self
-                    .client
-                    .send_metrics(self.request(MetricsRequest {
-                        shared_dimensions: self.shared_dimensions.clone(),
-                        metrics: batch,
-                    }))
-                    .await;
-                match result {
-                    Ok(success) => {
-                        log::debug!("sent metrics: {success:?}");
-                    }
-                    Err(err) => {
-                        if !err.metadata().is_empty() {
-                            log::error!(
-                                "failed to send metrics: {err}. Metadata: {:?}",
-                                err.metadata()
-                            );
-                        }
-                        log::error!("failed to send metrics: {err:?}")
-                    }
-                };
+                self.send_one(batch).await;
             }
         }
+    }
+
+    /// Send a single batch in one request, awaiting the response. Errors are logged.
+    async fn send_one(&mut self, batch: Vec<Datum>) {
+        let result = self
+            .client
+            .send_metrics(self.request(MetricsRequest {
+                shared_dimensions: self.shared_dimensions.clone(),
+                metrics: batch,
+            }))
+            .await;
+        match result {
+            Ok(success) => {
+                log::debug!("sent metrics: {success:?}");
+            }
+            Err(err) => {
+                if !err.metadata().is_empty() {
+                    log::error!(
+                        "failed to send metrics: {err}. Metadata: {:?}",
+                        err.metadata()
+                    );
+                }
+                log::error!("failed to send metrics: {err:?}")
+            }
+        };
     }
 
     fn request<T>(&self, request: T) -> tonic::Request<T> {
@@ -102,6 +107,24 @@ where
             request.metadata_mut().insert(*header, value.clone());
         }
         request
+    }
+}
+
+impl<TChannel> MetricsSender for GoodmetricsDownstream<TChannel>
+where
+    TChannel: tonic::client::GrpcService<tonic::body::Body> + Send,
+    TChannel::Future: Send,
+    TChannel::Error: Into<StdError>,
+    TChannel::ResponseBody: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    <TChannel::ResponseBody as http_body::Body>::Error: Into<StdError> + Send,
+{
+    type Batch = Vec<Datum>;
+
+    fn send_batch(
+        &mut self,
+        batch: Self::Batch,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.send_one(batch))
     }
 }
 
