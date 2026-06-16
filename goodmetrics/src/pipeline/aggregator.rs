@@ -288,7 +288,6 @@ where
 }
 
 /// Fold a single metrics object into an aggregation map.
-
 pub(crate) fn aggregate_metrics_into<TMetricsRef>(
     map: &mut AggregatedMetricsMap,
     distribution_mode: DistributionMode,
